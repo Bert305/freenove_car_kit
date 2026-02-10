@@ -1,3 +1,6 @@
+# python camera.py
+
+import os
 import time
 from picamera2 import Picamera2, Preview
 from picamera2.encoders import H264Encoder, JpegEncoder
@@ -33,10 +36,12 @@ class Camera:
         self.streaming_output = StreamingOutput()  # Initialize the streaming output object
         self.streaming = False  # Initialize the streaming flag
 
-    def start_image(self) -> None:
+    def start_image(self, preview: bool = True) -> None:
         """Start the camera preview and capture."""
-        self.camera.start_preview(Preview.QTGL)  # Start the camera preview using the QTGL backend
-        self.camera.start()                      # Start the camera
+        # Skip GUI preview when no display is available (headless/SSH).
+        if preview and os.environ.get("DISPLAY"):
+            self.camera.start_preview(Preview.QTGL)  # Start the camera preview using the QTGL backend
+        self.camera.start()                          # Start the camera
 
     def save_image(self, filename: str) -> dict:
         """Capture and save an image to the specified file."""
@@ -95,7 +100,7 @@ if __name__ == '__main__':
     camera = Camera()                                    # Create a Camera instance
 
     print("View image...")
-    camera.start_image()                                 # Start the camera preview
+    camera.start_image()                                 # Start the camera preview when available
     time.sleep(10)                                       # Wait for 10 seconds
     
     print("Capture image...")

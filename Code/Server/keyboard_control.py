@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 
-# cd /home/miamiedtech/Freenove_4WD_Smart_Car_Kit_for_Raspberry_Pi/Code/Server
-#   python3 keyboard_control.py   
+# cd /home/miamiedtech/Freenove_4WD_Smart_Car_Kit_for_Raspberry_Pi/Code/Server python3 keyboard_control.py   
 """
 Keyboard Control for Freenove 4WD Smart Car
 Controls:
