@@ -1,11 +1,15 @@
 """
 Obstacle Avoidance Script - Freenove 4WD Smart Car
 ===================================================
-Drives the car forward and automatically avoids obstacles using
-the ultrasonic sensor. When an obstacle is detected:
-  1. The car stops and reverses briefly.
-  2. The servo scans left and right to find the clearer path.
-  3. The car turns toward the clearer side, then resumes forward.
+Three-zone detection system:
+
+  GREEN  zone (>= WARNING_DISTANCE):  Drive forward at full speed.
+  YELLOW zone (WARNING_DISTANCE > d >= STOP_DISTANCE):
+      Obstacle spotted early – STOP immediately, scan left/right,
+      then curve around before ever getting close.
+  RED    zone (< STOP_DISTANCE):
+      Too close to steer – full emergency stop, reverse, then turn
+      until the path is clear.
 
 Run from the Code/Server/ directory:
     python obstacle_avoidance.py
@@ -14,152 +18,206 @@ Press Ctrl+C to stop.
 """
 
 import time
-import sys
 from ultrasonic import Ultrasonic
 from motor import Ordinary_Car
 from servo import Servo
 
 # ── Tunable constants ──────────────────────────────────────────────────────────
-STOP_DISTANCE     = 30   # cm – stop and react when obstacle is closer than this
-SAFE_DISTANCE     = 40   # cm – resume forward only when path is this clear
-DRIVE_SPEED       = 1500 # motor duty for normal forward driving  (0-4095)
-BACKUP_SPEED      = 1200 # motor duty when reversing
-TURN_SPEED        = 1500 # motor duty when turning
-BACKUP_TIME       = 0.5  # seconds to reverse before scanning
-TURN_TIME         = 0.6  # seconds to turn before re-checking
-SCAN_SETTLE_TIME  = 0.3  # seconds to wait after moving servo before reading
-LOOP_DELAY        = 0.05 # seconds between main loop iterations
+WARNING_DISTANCE  = 100  # cm – stop & scan when obstacle is this far away
+STOP_DISTANCE     = 35   # cm – emergency fallback if still approaching
+SAFE_DISTANCE     = 50   # cm – resume forward only when path is this clear
+
+DRIVE_SPEED       = 1500 # full forward speed (0-4095)
+BACKUP_SPEED      = 1200 # reverse speed during emergency manoeuvre
+TURN_SPEED        = 1500 # speed used for on-the-spot turns
+STEER_INNER       = 300  # inner-wheel duty when smoothly curving
+STEER_OUTER       = 1800 # outer-wheel duty when smoothly curving
+
+BACKUP_TIME       = 0.5  # seconds to reverse before scanning (emergency only)
+TURN_TIME         = 0.6  # seconds per turn step (emergency only)
+SCAN_SETTLE_TIME  = 0.15 # seconds to let servo settle before reading (was 0.25)
+LOOP_DELAY        = 0.01 # seconds between main-loop iterations (was 0.05)
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Servo angle positions (channel '0' is the pan/horizontal servo)
-SERVO_CENTER = 90   # degrees – facing forward
-SERVO_LEFT   = 150  # degrees – facing left
-SERVO_RIGHT  = 30   # degrees – facing right
+SERVO_CENTER = 90
+SERVO_LEFT   = 150
+SERVO_RIGHT  = 30
 
 
-def scan_distances(sonic: Ultrasonic, servo: Servo) -> dict:
+# ── Motor helpers ──────────────────────────────────────────────────────────────
+
+def stop(motor: Ordinary_Car):
+    motor.set_motor_model(0, 0, 0, 0)
+
+def drive_forward(motor: Ordinary_Car, speed: int = DRIVE_SPEED):
+    motor.set_motor_model(speed, speed, speed, speed)
+
+def drive_backward(motor: Ordinary_Car, speed: int = BACKUP_SPEED):
+    motor.set_motor_model(-speed, -speed, -speed, -speed)
+
+def turn_left(motor: Ordinary_Car, speed: int = TURN_SPEED):
+    """Spin left in place."""
+    motor.set_motor_model(-speed, -speed, speed, speed)
+
+def turn_right(motor: Ordinary_Car, speed: int = TURN_SPEED):
+    """Spin right in place."""
+    motor.set_motor_model(speed, speed, -speed, -speed)
+
+def curve_left(motor: Ordinary_Car):
+    """Gentle curve left – left wheels slower, right wheels faster."""
+    motor.set_motor_model(STEER_INNER, STEER_INNER, STEER_OUTER, STEER_OUTER)
+
+def curve_right(motor: Ordinary_Car):
+    """Gentle curve right – right wheels slower, left wheels faster."""
+    motor.set_motor_model(STEER_OUTER, STEER_OUTER, STEER_INNER, STEER_INNER)
+
+
+# ── Sensor helpers ─────────────────────────────────────────────────────────────
+
+def read_distance(sonic: Ultrasonic, servo: Servo, angle: int) -> float:
+    """Point servo to angle, wait for it to settle, return distance in cm."""
+    servo.set_servo_pwm('0', angle)
+    time.sleep(SCAN_SETTLE_TIME)
+    d = sonic.get_distance()
+    return d if d is not None else 0.0
+
+def quick_scan(sonic: Ultrasonic, servo: Servo) -> tuple[float, float]:
     """
-    Point the servo left, centre, and right, take a distance reading at each
-    position, then return the servo to centre.
+    Quick left/right scan while the car can still move.
+    Returns (left_cm, right_cm). Restores servo to centre when done.
+    """
+    left  = read_distance(sonic, servo, SERVO_LEFT)
+    right = read_distance(sonic, servo, SERVO_RIGHT)
+    servo.set_servo_pwm('0', SERVO_CENTER)
+    time.sleep(SCAN_SETTLE_TIME)
+    print(f"  Quick scan → left={left:.1f} cm  right={right:.1f} cm")
+    return left, right
 
-    Returns a dict with keys 'left', 'centre', 'right' (values in cm).
+def full_scan(sonic: Ultrasonic, servo: Servo) -> dict:
+    """
+    Full three-point scan (left / centre / right).
+    Used during the emergency manoeuvre when the car is stationary.
+    Returns dict with keys 'left', 'centre', 'right'.
     """
     readings = {}
-    positions = [
-        ('left',   SERVO_LEFT),
-        ('centre', SERVO_CENTER),
-        ('right',  SERVO_RIGHT),
-    ]
-    for label, angle in positions:
-        servo.set_servo_pwm('0', angle)
-        time.sleep(SCAN_SETTLE_TIME)
-        dist = sonic.get_distance()
-        readings[label] = dist if dist is not None else 0.0
-        print(f"  Scan {label:6s} ({angle:3d}°): {readings[label]:.1f} cm")
-
-    # Return servo to centre
+    for label, angle in [('left', SERVO_LEFT), ('centre', SERVO_CENTER), ('right', SERVO_RIGHT)]:
+        readings[label] = read_distance(sonic, servo, angle)
+        print(f"  Full scan {label:6s} ({angle:3d}°): {readings[label]:.1f} cm")
     servo.set_servo_pwm('0', SERVO_CENTER)
     time.sleep(SCAN_SETTLE_TIME)
     return readings
 
 
-def drive_forward(motor: Ordinary_Car, speed: int = DRIVE_SPEED):
-    """All four wheels forward."""
-    motor.set_motor_model(speed, speed, speed, speed)
+# ── Avoidance behaviours ───────────────────────────────────────────────────────
 
-
-def drive_backward(motor: Ordinary_Car, speed: int = BACKUP_SPEED):
-    """All four wheels backward."""
-    motor.set_motor_model(-speed, -speed, -speed, -speed)
-
-
-def turn_left(motor: Ordinary_Car, speed: int = TURN_SPEED):
-    """Left wheels backward, right wheels forward → turns left."""
-    motor.set_motor_model(-speed, -speed, speed, speed)
-
-
-def turn_right(motor: Ordinary_Car, speed: int = TURN_SPEED):
-    """Left wheels forward, right wheels backward → turns right."""
-    motor.set_motor_model(speed, speed, -speed, -speed)
-
-
-def stop(motor: Ordinary_Car):
-    motor.set_motor_model(0, 0, 0, 0)
-
-
-def avoid_obstacle(motor: Ordinary_Car, sonic: Ultrasonic, servo: Servo):
+def steer_around(motor: Ordinary_Car, sonic: Ultrasonic, servo: Servo) -> bool:
     """
-    Full obstacle-avoidance manoeuvre:
-      1. Stop immediately.
-      2. Reverse for BACKUP_TIME seconds.
-      3. Scan left, centre, and right.
-      4. Turn toward whichever side has more space.
-      5. Keep turning until the forward path is clear.
+    YELLOW zone: obstacle spotted early enough to steer around it.
+    Slows the car, scans left/right, and curves toward the clearer side
+    while still moving forward.
+
+    Returns True if the car successfully steered clear (front now open),
+    or False if the obstacle is still too close and needs emergency handling.
     """
-    print("Obstacle detected! Stopping...")
+    print("[YELLOW] Obstacle ahead – stopping to scan...")
     stop(motor)
     time.sleep(0.1)
 
-    print("Reversing...")
+    left, right = quick_scan(sonic, servo)
+
+    if left >= right:
+        print(f"  Curving LEFT (more space: {left:.1f} cm vs {right:.1f} cm)")
+        curve_left(motor)
+    else:
+        print(f"  Curving RIGHT (more space: {right:.1f} cm vs {left:.1f} cm)")
+        curve_right(motor)
+
+    # Curve for a short burst then re-check the front
+    time.sleep(0.4)
+
+    servo.set_servo_pwm('0', SERVO_CENTER)
+    time.sleep(SCAN_SETTLE_TIME)
+    front = sonic.get_distance() or 0.0
+    print(f"  Front after steering: {front:.1f} cm")
+    return front >= SAFE_DISTANCE
+
+
+def emergency_avoid(motor: Ordinary_Car, sonic: Ultrasonic, servo: Servo):
+    """
+    RED zone: too close to steer. Full stop → reverse → scan → turn until clear.
+    """
+    print("[RED] Too close! Emergency stop.")
+    stop(motor)
+    time.sleep(0.1)
+
+    print("  Reversing...")
     drive_backward(motor)
     time.sleep(BACKUP_TIME)
     stop(motor)
     time.sleep(0.1)
 
-    print("Scanning for clear path...")
-    distances = scan_distances(sonic, servo)
+    print("  Full scan for clear path...")
+    distances = full_scan(sonic, servo)
 
-    # Decide which way to turn
     if distances['left'] >= distances['right']:
-        print(f"Turning LEFT  (left={distances['left']:.1f} cm  right={distances['right']:.1f} cm)")
+        print(f"  Turning LEFT (left={distances['left']:.1f}  right={distances['right']:.1f})")
         turn_action = turn_left
     else:
-        print(f"Turning RIGHT (left={distances['left']:.1f} cm  right={distances['right']:.1f} cm)")
+        print(f"  Turning RIGHT (right={distances['right']:.1f}  left={distances['left']:.1f})")
         turn_action = turn_right
 
-    # Keep turning until the centre is clear
+    # Keep turning until the front is clear
     while True:
         turn_action(motor)
         time.sleep(TURN_TIME)
         stop(motor)
         time.sleep(0.1)
 
-        servo.set_servo_pwm('0', SERVO_CENTER)
-        time.sleep(SCAN_SETTLE_TIME)
-        front_dist = sonic.get_distance() or 0.0
-        print(f"  Front distance after turn: {front_dist:.1f} cm")
-
-        if front_dist >= SAFE_DISTANCE:
-            print("Path clear – resuming forward drive.\n")
+        front = read_distance(sonic, servo, SERVO_CENTER)
+        print(f"  Front after turn step: {front:.1f} cm")
+        if front >= SAFE_DISTANCE:
+            print("  Path clear – resuming.\n")
             break
 
 
+# ── Main loop ──────────────────────────────────────────────────────────────────
+
 def run():
-    """Main entry point."""
     print("Initialising hardware...")
     motor = Ordinary_Car()
     sonic = Ultrasonic()
     servo = Servo()
 
-    # Point the sensor straight ahead at startup
     servo.set_servo_pwm('0', SERVO_CENTER)
     time.sleep(0.5)
 
-    print("Obstacle avoidance running. Press Ctrl+C to stop.\n")
+    print("Obstacle avoidance running.  Press Ctrl+C to stop.\n")
+    print(f"  GREEN  zone : >= {WARNING_DISTANCE} cm  → full speed ahead")
+    print(f"  YELLOW zone : {STOP_DISTANCE}–{WARNING_DISTANCE} cm → slow & steer")
+    print(f"  RED    zone : <  {STOP_DISTANCE} cm  → emergency stop\n")
+
     try:
         while True:
-            # Read the distance straight ahead
             distance = sonic.get_distance()
             if distance is None:
-                # Sensor glitch – keep moving cautiously
                 time.sleep(LOOP_DELAY)
                 continue
 
-            print(f"Distance: {distance:.1f} cm", end='\r')
+            print(f"Distance: {distance:5.1f} cm", end='\r')
 
             if distance < STOP_DISTANCE:
-                avoid_obstacle(motor, sonic, servo)
+                # RED zone – emergency manoeuvre
+                emergency_avoid(motor, sonic, servo)
+
+            elif distance < WARNING_DISTANCE:
+                # YELLOW zone – try to steer around while still moving
+                cleared = steer_around(motor, sonic, servo)
+                if not cleared:
+                    # Steering wasn't enough – hand off to emergency handler
+                    emergency_avoid(motor, sonic, servo)
+
             else:
+                # GREEN zone – open road, full speed
                 drive_forward(motor)
 
             time.sleep(LOOP_DELAY)
