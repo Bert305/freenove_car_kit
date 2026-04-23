@@ -66,7 +66,7 @@ def run():
     print("──────────────────────────────────────────\n")
 
     try:
-        tty.cbreak(fd)
+        tty.setcbreak(fd)
 
         while True:
             value = infrared.read_all_infrared()
