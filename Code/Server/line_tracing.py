@@ -32,7 +32,7 @@ TURN_OUTER      = 1800  # outer wheel speed during a hard turn
 TURN_INNER      = -300  # inner wheel speed during a hard turn
 CURVE_OUTER     = 1400  # outer wheel speed during a gentle curve
 CURVE_INNER     = 300   # inner wheel speed during a gentle curve
-MANUAL_SPEED    = 600   # wheel speed used for manual nudges
+MANUAL_SPEED    = 1500  # wheel speed used for manual nudges
 LOOP_DELAY      = 0.01  # seconds between sensor reads
 # ──────────────────────────────────────────────────────────────────────────────
 
