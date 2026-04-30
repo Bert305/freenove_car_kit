@@ -123,3 +123,19 @@ if __name__ == '__main__':
     print("Close camera...")
     camera.close()                                       # Close the camera
     '''
+
+# Camera strip switch
+
+
+# camera_auto_detect=1= auto choose
+# camera_auto_detect=0= manual choose only (recommended)
+# display_auto_detect=1 # must be this
+
+
+# Terminal:
+# sudo nano /boot/firmware/config.txt
+# dtoverlay=ov5647,cam1 or dtoverlay=ov5647,cam0
+# CTRL + X
+# Y
+# Enter
+# sudo reboot (edited)
